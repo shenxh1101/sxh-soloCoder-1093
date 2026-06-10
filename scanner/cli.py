@@ -62,6 +62,72 @@ def _stream_process(args: list, description: str) -> int:
     return proc.returncode
 
 
+def _save_image_with_progress(image_ref: str, tar_path: str) -> None:
+    click.echo(f"  [docker save] Exporting {image_ref} ...")
+    start_time = time.time()
+    last_report_time = start_time
+    bytes_written = 0
+    last_report_bytes = 0
+    proc = None
+    success = False
+
+    try:
+        proc = subprocess.Popen(
+            ["docker", "save", image_ref],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        with open(tar_path, "wb") as f:
+            while True:
+                chunk = proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                f.flush()
+                bytes_written += len(chunk)
+                now = time.time()
+                if now - last_report_time >= 1.0:
+                    size_mb = bytes_written / (1024 * 1024)
+                    elapsed = now - start_time
+                    speed_mb = (bytes_written - last_report_bytes) / (1024 * 1024) / (now - last_report_time) if now > last_report_time else 0
+                    click.echo(f"    {size_mb:>8.1f} MB  written  ({speed_mb:.1f} MB/s)")
+                    last_report_time = now
+                    last_report_bytes = bytes_written
+
+        proc.stdout.close()
+        returncode = proc.wait()
+
+        if returncode != 0:
+            stderr_output = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            proc.stderr.close()
+            error_msg = stderr_output or f"exit code: {returncode}"
+            raise RuntimeError(f"docker save failed: {error_msg}")
+
+        proc.stderr.close()
+        success = True
+
+        total_time = time.time() - start_time
+        size_mb = bytes_written / (1024 * 1024)
+        click.echo(f"    {size_mb:>8.1f} MB  total  ({total_time:.1f}s, {size_mb / total_time:.1f} MB/s)")
+        click.echo(f"  [docker save] Done.")
+    except KeyboardInterrupt:
+        click.echo("\n  [docker save] Interrupted by user.")
+        raise
+    finally:
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if not success and os.path.exists(tar_path):
+            try:
+                os.remove(tar_path)
+            except OSError:
+                pass
+
+
 def _resolve_image_to_tar(target: str) -> tuple:
     import tarfile as tf
 
@@ -89,12 +155,7 @@ def _resolve_image_to_tar(target: str) -> tuple:
     safe_name = re.sub(r'[^\w\-.]', '_', image_ref)
     tar_path = os.path.join(tmp_dir, f"{safe_name}.tar")
 
-    click.echo(f"  [docker save] Exporting to {tar_path} ...")
-    ret = _stream_process(["docker", "save", "-o", tar_path, image_ref], "save")
-    if ret != 0:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise click.ClickException(f"Failed to save image: {image_ref} (exit code: {ret})")
-    click.echo(f"  [docker save] Done.")
+    _save_image_with_progress(image_ref, tar_path)
 
     file_size_mb = os.path.getsize(tar_path) / (1024 * 1024)
     click.echo(f"  Exported: {tar_path} ({file_size_mb:.1f} MB)")

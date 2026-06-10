@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -169,7 +170,7 @@ class VulnerabilityMatcher:
                               installed_version: str, distro: str) -> str:
         if package_name in entry.fixed_versions:
             ver = entry.fixed_versions[package_name]
-            if ver and ver != package_name and not ver.replace(".", "").isdigit() == False:
+            if ver and ver != package_name and ver != installed_version and re.search(r'\d', ver):
                 return ver
 
         if "*" in entry.fixed_versions:

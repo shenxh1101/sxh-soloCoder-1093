@@ -219,6 +219,11 @@ class FixVersionDatabase:
             (r'fixed\s+in\s+version\s+(\d[\w.+\-~]*?)\s+of\s+([a-z][\w.\-]+)', 2, 1),
             (r'([a-z][\w.\-]+?)\s+was\s+fixed\s+in\s+version\s+(\d[\w.+\-~]*)', 1, 2),
             (r'update\s+to\s+version\s+(\d[\w.+\-~]*)\s+(?:fixes|addresses|resolves)', 1, 1),
+            (r'(?:update|upgrade)\s+([a-z][\w.\-]+)\s+(?:package\s+)?(?:to\s+)?(?:version\s+)?(\d[\d.:\-~+a-z]*?\.el\d)', 1, 2),
+            (r'(?:update|upgrade)\s+([a-z][\w.\-]+)\s+(?:package\s+)?(?:to\s+)?(?:version\s+)?(\d[\d.:\-~+a-z]*?\+deb\d+u\d+)', 1, 2),
+            (r'([a-z][\w.\-]+)-(\d[\d.:\-~+a-z]*?\.el\d\b)', 1, 2),
+            (r'([a-z][\w.\-]+)-(\d[\d.:\-~+a-z]*?\+deb\d+u\d+\b)', 1, 2),
+            (r'([a-z][\w.\-]+)-(\d[\d.:\-~+a-z]*?\-r\d+\b)', 1, 2),
             (r'DSA-\d+[\-\d]*\s+([a-z][\w.\-]+)\s+(\d[\d.:\-~+a-z]*)', 1, 2),
             (r'DLA-\d+[\-\d]*\s+([a-z][\w.\-]+)\s+(\d[\d.:\-~+a-z]*)', 1, 2),
             (r'(RH[SEBA]{2,3}-\d{4}:\d+)', 0, 1),
@@ -257,7 +262,7 @@ class FixVersionDatabase:
                 if re.match(r'^RH[SEBA]{2,3}-\d{4}:\d+$', fix_ver, re.IGNORECASE):
                     fix_ver = fix_ver.upper()
 
-                if pkg_name and re.search(r'\d', pkg_name) and len(pkg_name) < 20:
+                if pkg_name and re.search(r'^\d+$', pkg_name) and len(pkg_name) < 20:
                     continue
 
                 if pkg_name and pkg_name != "*":
