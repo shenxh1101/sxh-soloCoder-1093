@@ -2,8 +2,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from .image_parser import InstalledPackage
-from .utils import cpe_match_package, cvss_score_to_severity
-from .vuln_db import VulnerabilityDatabase, VulnerabilityEntry
+from .utils import cvss_score_to_severity
+from .vuln_db import VulnerabilityDatabase, VulnerabilityEntry, FixVersionDatabase
 
 
 @dataclass
@@ -22,6 +22,7 @@ class MatchResult:
     fixed_version: str = ""
     published_date: str = ""
     cpe_matched: str = ""
+    version_range_detail: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -39,6 +40,7 @@ class MatchResult:
             "fixed_version": self.fixed_version,
             "published_date": self.published_date,
             "cpe_matched": self.cpe_matched,
+            "version_range_detail": self.version_range_detail,
         }
 
 
@@ -46,9 +48,26 @@ class VulnerabilityMatcher:
     def __init__(self, vuln_db: VulnerabilityDatabase):
         self.vuln_db = vuln_db
         self.ignored_cves: Set[str] = set()
+        self.fix_db: FixVersionDatabase = vuln_db.fix_db
 
     def set_ignored_cves(self, cve_ids: List[str]) -> None:
         self.ignored_cves = set(cve_ids)
+
+    def _version_in_affected_range(self, version: str, version_range, cpe_version: str) -> bool:
+        from packaging import version as pkg_version
+
+        if version_range and not version_range.is_unrestricted():
+            return version_range.contains_version(version)
+
+        if cpe_version == "*" or cpe_version == "-":
+            return True
+
+        try:
+            installed = pkg_version.parse(version)
+            cpe_ver = pkg_version.parse(cpe_version)
+            return installed == cpe_ver
+        except pkg_version.InvalidVersion:
+            return version == cpe_version
 
     def match_package(self, package: InstalledPackage, distro: str = "") -> List[MatchResult]:
         results: List[MatchResult] = []
@@ -72,56 +91,103 @@ class VulnerabilityMatcher:
                     if entry.cve_id in self.ignored_cves:
                         continue
 
-                    matched_cpe = ""
-                    for cpe in entry.cpe_matches:
-                        parts = cpe.split(":")
-                        if len(parts) >= 6:
-                            cpe_vendor = parts[3].lower()
-                            cpe_product = parts[4].lower()
-                            cpe_version = parts[5]
+                    best_detail = None
+                    for detail in entry.cpe_match_details:
+                        if not detail.vulnerable:
+                            continue
 
-                            vendor_match = (
-                                not vendor
-                                or cpe_vendor == vendor.lower()
-                                or cpe_vendor in vendor.lower()
-                                or vendor.lower() in cpe_vendor
-                                or cpe_vendor == "*"
-                            )
+                        dv = detail.vendor.lower()
+                        dp = detail.product.lower()
+                        sv = vendor.lower() if vendor else ""
+                        sp = search_term.lower()
 
-                            product_match = (
-                                cpe_product == search_term.lower()
-                                or search_term.lower() in cpe_product
-                                or cpe_product in search_term.lower()
-                                or cpe_product == "*"
-                            )
+                        vendor_ok = (
+                            not vendor
+                            or dv == "*"
+                            or dv == sv
+                            or sv in dv
+                            or dv in sv
+                        )
 
-                            if vendor_match and product_match:
-                                matched_cpe = cpe
+                        product_ok = (
+                            dp == "*"
+                            or dp == sp
+                            or sp in dp
+                            or dp in sp
+                        )
 
-                                if cpe_version != "*" and cpe_version != "-":
-                                    if not cpe_match_package(cpe, vendor, search_term, package.version):
-                                        continue
+                        if not vendor_ok or not product_ok:
+                            continue
 
-                                result = MatchResult(
-                                    cve_id=entry.cve_id,
-                                    description=entry.description,
-                                    cvss_v3_score=entry.cvss_v3_score,
-                                    cvss_v2_score=entry.cvss_v2_score,
-                                    severity=entry.severity,
-                                    package_name=package.name,
-                                    package_version=package.version,
-                                    layer_order=package.layer_order,
-                                    package_manager=package.package_manager,
-                                    distro=distro,
-                                    references=entry.references,
-                                    fixed_version=entry.fixed_versions.get(package.name, ""),
-                                    published_date=entry.published_date,
-                                    cpe_matched=matched_cpe,
-                                )
-                                results.append(result)
-                                break
+                        if not self._version_in_affected_range(
+                            package.version,
+                            detail.version_range,
+                            detail.cpe_version_fragment
+                        ):
+                            continue
+
+                        best_detail = detail
+                        break
+
+                    if best_detail is None:
+                        continue
+
+                    ver_range_str = ""
+                    vr = best_detail.version_range
+                    if not vr.is_unrestricted():
+                        parts = []
+                        if vr.start_including:
+                            parts.append(f">={vr.start_including}")
+                        if vr.start_excluding:
+                            parts.append(f">{vr.start_excluding}")
+                        if vr.end_including:
+                            parts.append(f"<={vr.end_including}")
+                        if vr.end_excluding:
+                            parts.append(f"<{vr.end_excluding}")
+                        ver_range_str = ", ".join(parts)
+                    elif best_detail.cpe_version_fragment not in ("*", "-"):
+                        ver_range_str = f"=={best_detail.cpe_version_fragment}"
+                    else:
+                        ver_range_str = "all versions"
+
+                    fix_ver = self._resolve_fix_version(
+                        entry, package.name, package.version, distro
+                    )
+
+                    result = MatchResult(
+                        cve_id=entry.cve_id,
+                        description=entry.description,
+                        cvss_v3_score=entry.cvss_v3_score,
+                        cvss_v2_score=entry.cvss_v2_score,
+                        severity=entry.severity,
+                        package_name=package.name,
+                        package_version=package.version,
+                        layer_order=package.layer_order,
+                        package_manager=package.package_manager,
+                        distro=distro,
+                        references=entry.references,
+                        fixed_version=fix_ver,
+                        published_date=entry.published_date,
+                        cpe_matched=best_detail.criteria,
+                        version_range_detail=ver_range_str,
+                    )
+                    results.append(result)
 
         return self._deduplicate_results(results)
+
+    def _resolve_fix_version(self, entry: VulnerabilityEntry, package_name: str,
+                              installed_version: str, distro: str) -> str:
+        if package_name in entry.fixed_versions:
+            return entry.fixed_versions[package_name]
+
+        if "*" in entry.fixed_versions:
+            return entry.fixed_versions["*"]
+
+        fix_ver = self.fix_db.get_fix_version(package_name, installed_version, distro)
+        if fix_ver:
+            return fix_ver
+
+        return ""
 
     def match_packages(self, packages: List[InstalledPackage], distro: str = "") -> List[MatchResult]:
         all_results: List[MatchResult] = []
@@ -153,6 +219,8 @@ class VulnerabilityMatcher:
         unique_packages = len(set(r.package_name for r in results))
         unique_cves = len(set(r.cve_id for r in results))
 
+        with_fix = sum(1 for r in results if r.fixed_version)
+
         layer_distribution: Dict[int, int] = {}
         for r in results:
             layer_distribution[r.layer_order] = layer_distribution.get(r.layer_order, 0) + 1
@@ -166,5 +234,6 @@ class VulnerabilityMatcher:
             "unknown": unknown,
             "unique_affected_packages": unique_packages,
             "unique_cves": unique_cves,
+            "fix_available": with_fix,
             "layer_distribution": layer_distribution,
         }

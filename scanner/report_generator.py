@@ -40,6 +40,7 @@ class ReportGenerator:
         lines.append(f"  UNKNOWN:   {self.summary['unknown']:>5}")
         lines.append(f"  Unique CVEs:               {self.summary['unique_cves']}")
         lines.append(f"  Affected Packages:         {self.summary['unique_affected_packages']}")
+        lines.append(f"  Fix Available:             {self.summary.get('fix_available', 0)}")
         lines.append("")
         lines.append("-" * 80)
         lines.append("  LAYER RISK DISTRIBUTION")
@@ -59,6 +60,8 @@ class ReportGenerator:
             lines.append(f"      CVSS v3: {r.cvss_v3_score}  CVSS v2: {r.cvss_v2_score}")
             lines.append(f"      Package: {r.package_name}@{r.package_version}")
             lines.append(f"      Layer:   {r.layer_order}  Manager: {r.package_manager}")
+            if r.version_range_detail:
+                lines.append(f"      Affected Range: {r.version_range_detail}")
             if r.description:
                 desc = r.description[:200] + "..." if len(r.description) > 200 else r.description
                 lines.append(f"      Description: {desc}")
@@ -144,8 +147,8 @@ class ReportGenerator:
         fieldnames = [
             "cve_id", "severity", "cvss_v3_score", "cvss_v2_score",
             "package_name", "package_version", "layer_order", "package_manager",
-            "distro", "fixed_version", "published_date", "description",
-            "references", "cpe_matched",
+            "distro", "fixed_version", "version_range_detail", "published_date",
+            "description", "references", "cpe_matched",
         ]
 
         with open(output_file, "w", newline="", encoding="utf-8") as f:
@@ -236,6 +239,8 @@ HTML_TEMPLATE = r"""
         .cvss-high { color: #fd7e14; }
         .cvss-medium { color: #ffc107; }
         .cvss-low { color: #0d6efd; }
+        .fix-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; background: #d4edda; color: #155724; }
+        .no-fix-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; background: #f8d7da; color: #721c24; }
         .filter-bar { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
         .filter-bar input, .filter-bar select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }
         .filter-bar input { flex: 1; min-width: 200px; }
@@ -250,7 +255,7 @@ HTML_TEMPLATE = r"""
 <body>
     <div class="container">
         <div class="header">
-            <h1>🔍 Container Vulnerability Scan Report</h1>
+            <h1>Container Vulnerability Scan Report</h1>
             <div class="subtitle">Generated at {{ scan_time }}</div>
             <div class="meta">
                 <div class="meta-item">
@@ -299,6 +304,10 @@ HTML_TEMPLATE = r"""
                     <div class="count">{{ summary.unique_affected_packages }}</div>
                     <div class="label">Affected Packages</div>
                 </div>
+                <div class="summary-card">
+                    <div class="count">{{ summary.get('fix_available', 0) }}</div>
+                    <div class="label">Fix Available</div>
+                </div>
             </div>
         </div>
 
@@ -346,7 +355,8 @@ HTML_TEMPLATE = r"""
                             <th>Package</th>
                             <th>Version</th>
                             <th>Layer</th>
-                            <th>Fixed</th>
+                            <th>Fix Version</th>
+                            <th>Manager</th>
                             <th></th>
                         </tr>
                     </thead>
@@ -364,16 +374,30 @@ HTML_TEMPLATE = r"""
                             <td><span class="code">{{ r.package_name }}</span></td>
                             <td>{{ r.package_version }}</td>
                             <td>Layer {{ r.layer_order }}</td>
-                            <td>{{ r.fixed_version or '-' }}</td>
                             <td>
-                                <span class="detail-toggle" onclick="toggleDetail(this, 'detail-{{ loop.index }}')">Details ▸</span>
+                                {% if r.fixed_version %}
+                                <span class="fix-badge">{{ r.fixed_version }}</span>
+                                {% else %}
+                                <span class="no-fix-badge">-</span>
+                                {% endif %}
+                            </td>
+                            <td><span class="code">{{ r.package_manager }}</span></td>
+                            <td>
+                                <span class="detail-toggle" onclick="toggleDetail(this, 'detail-{{ loop.index }}')">Details &#9654;</span>
                             </td>
                         </tr>
                         <tr id="detail-{{ loop.index }}" class="detail-content">
-                            <td colspan="8">
+                            <td colspan="9">
                                 <strong>Description:</strong> {{ r.description }}<br><br>
+                                {% if r.version_range_detail %}
+                                <strong>Affected Version Range:</strong> {{ r.version_range_detail }}<br><br>
+                                {% endif %}
+                                {% if r.fixed_version %}
+                                <strong>Fix Version:</strong> {{ r.fixed_version }}<br><br>
+                                {% endif %}
                                 <strong>Published:</strong> {{ r.published_date }}<br>
                                 <strong>Package Manager:</strong> {{ r.package_manager }}<br>
+                                <strong>Matched CPE:</strong> <span class="code">{{ r.cpe_matched }}</span><br><br>
                                 <strong>References:</strong><br>
                                 {% for ref in r.references[:5] %}
                                 <a href="{{ ref }}" target="_blank" class="ref-link">{{ ref }}</a>
@@ -395,7 +419,7 @@ HTML_TEMPLATE = r"""
         function toggleDetail(el, detailId) {
             const detail = document.getElementById(detailId);
             detail.classList.toggle('show');
-            el.textContent = detail.classList.contains('show') ? 'Details ▾' : 'Details ▸';
+            el.innerHTML = detail.classList.contains('show') ? 'Details &#9660;' : 'Details &#9654;';
         }
 
         function filterTable() {
