@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -26,7 +27,8 @@ def _is_docker_available() -> bool:
 def _is_image_reference(target: str) -> bool:
     target_path = Path(target)
     if target_path.exists() and target_path.is_file():
-        if tarfile.is_tarfile(target):
+        import tarfile as tf
+        if tf.is_tarfile(target):
             return False
     if ":" in target and not target_path.exists():
         return True
@@ -35,6 +37,29 @@ def _is_image_reference(target: str) -> bool:
     if not target_path.exists():
         return True
     return False
+
+
+def _stream_process(args: list, description: str) -> int:
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    last_line = ""
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line:
+            last_line = line
+            if len(line) > 120:
+                line = line[:117] + "..."
+            click.echo(f"    {line}")
+
+    proc.wait()
+    return proc.returncode
 
 
 def _resolve_image_to_tar(target: str) -> tuple:
@@ -54,32 +79,25 @@ def _resolve_image_to_tar(target: str) -> tuple:
     image_ref = target
     click.echo(f"  Resolving image: {image_ref}")
 
-    click.echo(f"  Pulling image...")
-    pull_result = subprocess.run(
-        ["docker", "pull", image_ref],
-        capture_output=False,
-        text=True,
-    )
-    if pull_result.returncode != 0:
-        raise click.ClickException(f"Failed to pull image: {image_ref}")
+    click.echo(f"  [docker pull] Pulling {image_ref} ...")
+    ret = _stream_process(["docker", "pull", image_ref], "pull")
+    if ret != 0:
+        raise click.ClickException(f"Failed to pull image: {image_ref} (exit code: {ret})")
+    click.echo(f"  [docker pull] Done.")
 
     tmp_dir = tempfile.mkdtemp(prefix="scanner_docker_")
-    tar_path = os.path.join(tmp_dir, f"{image_ref.replace('/', '_').replace(':', '_')}.tar")
-
     safe_name = re.sub(r'[^\w\-.]', '_', image_ref)
     tar_path = os.path.join(tmp_dir, f"{safe_name}.tar")
 
-    click.echo(f"  Exporting image to temporary file...")
-    save_result = subprocess.run(
-        ["docker", "save", "-o", tar_path, image_ref],
-        capture_output=True,
-        text=True,
-    )
-    if save_result.returncode != 0:
+    click.echo(f"  [docker save] Exporting to {tar_path} ...")
+    ret = _stream_process(["docker", "save", "-o", tar_path, image_ref], "save")
+    if ret != 0:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise click.ClickException(f"Failed to save image: {image_ref}\n{save_result.stderr}")
+        raise click.ClickException(f"Failed to save image: {image_ref} (exit code: {ret})")
+    click.echo(f"  [docker save] Done.")
 
-    click.echo(f"  Image exported to: {tar_path}")
+    file_size_mb = os.path.getsize(tar_path) / (1024 * 1024)
+    click.echo(f"  Exported: {tar_path} ({file_size_mb:.1f} MB)")
     return tar_path, tmp_dir
 
 
@@ -87,8 +105,9 @@ def _cleanup_temp_dir(tmp_dir: Optional[str]) -> None:
     if tmp_dir and os.path.isdir(tmp_dir):
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+            click.echo(f"  [cleanup] Temporary directory removed: {tmp_dir}")
+        except Exception as e:
+            click.echo(f"  [cleanup] Warning: could not remove {tmp_dir}: {e}")
 
 
 @click.group()
@@ -110,7 +129,6 @@ def cli(ctx, offline, db_dir, ignore_file):
         config.ignore_file = Path(ignore_file)
 
     config.load_ignore_list()
-
     ctx.obj = config
 
 

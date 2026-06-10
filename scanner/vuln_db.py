@@ -1,9 +1,7 @@
 import gzip
 import json
 import os
-import pathlib
 import re
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,6 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 
 from .config import ScannerConfig
+from .utils import version_lt, version_le, version_gt, version_ge, version_eq
 
 
 @dataclass
@@ -41,45 +40,14 @@ class VersionRange:
         )
 
     def contains_version(self, version: str) -> bool:
-        from packaging import version as pkg_version
-
-        try:
-            actual = pkg_version.parse(version)
-        except pkg_version.InvalidVersion:
-            return True
-
-        if self.start_including:
-            try:
-                start_v = pkg_version.parse(self.start_including)
-                if actual < start_v:
-                    return False
-            except pkg_version.InvalidVersion:
-                pass
-
-        if self.start_excluding:
-            try:
-                start_v = pkg_version.parse(self.start_excluding)
-                if actual <= start_v:
-                    return False
-            except pkg_version.InvalidVersion:
-                pass
-
-        if self.end_including:
-            try:
-                end_v = pkg_version.parse(self.end_including)
-                if actual > end_v:
-                    return False
-            except pkg_version.InvalidVersion:
-                pass
-
-        if self.end_excluding:
-            try:
-                end_v = pkg_version.parse(self.end_excluding)
-                if actual >= end_v:
-                    return False
-            except pkg_version.InvalidVersion:
-                pass
-
+        if self.start_including and version_lt(version, self.start_including):
+            return False
+        if self.start_excluding and version_le(version, self.start_excluding):
+            return False
+        if self.end_including and version_gt(version, self.end_including):
+            return False
+        if self.end_excluding and version_ge(version, self.end_excluding):
+            return False
         return True
 
     def is_unrestricted(self) -> bool:
@@ -157,7 +125,6 @@ class VulnerabilityEntry:
     def from_dict(cls, data: dict) -> "VulnerabilityEntry":
         details_data = data.get("cpe_match_details", [])
         details = [CPEMatchDetail.from_dict(d) for d in details_data]
-
         return cls(
             cve_id=data.get("cve_id", ""),
             description=data.get("description", ""),
@@ -183,30 +150,11 @@ class VulnerabilityEntry:
             dp = detail.product.lower()
             sv = vendor.lower()
             sp = product.lower()
-
             vendor_ok = dv == "*" or dv == sv or sv in dv or dv in sv
             product_ok = dp == "*" or dp == sp or sp in dp or dp in sp
-
             if vendor_ok and product_ok:
                 relevant.append(detail)
         return relevant
-
-
-def _safe_parse_version(version_str: str) -> Optional[Any]:
-    from packaging import version as pkg_version
-    try:
-        return pkg_version.parse(version_str)
-    except pkg_version.InvalidVersion:
-        pass
-
-    clean = re.sub(r'[^0-9.]', '', version_str)
-    if clean and clean.count('.') >= 1:
-        try:
-            return pkg_version.parse(clean)
-        except pkg_version.InvalidVersion:
-            pass
-
-    return None
 
 
 class FixVersionDatabase:
@@ -231,7 +179,6 @@ class FixVersionDatabase:
         candidates = [product]
         if distro:
             candidates.insert(0, f"{distro}:{product}")
-
         for key in candidates:
             if key in self._fix_data:
                 versions = self._fix_data[key]
@@ -249,64 +196,75 @@ class FixVersionDatabase:
     @staticmethod
     def _version_in_range(version: str, range_spec: str) -> bool:
         range_spec = range_spec.strip()
-
-        parsed_actual = _safe_parse_version(version)
-        if parsed_actual is None:
-            return version == range_spec
-
         if range_spec.startswith(">=") and "<" in range_spec:
             parts = range_spec.split("<")
-            lower = _safe_parse_version(parts[0][2:].strip())
-            upper = _safe_parse_version(parts[1].strip())
-            if lower is not None and upper is not None:
-                return lower <= parsed_actual < upper
-            if lower is not None:
-                return lower <= parsed_actual
-            if upper is not None:
-                return parsed_actual < upper
-        elif "<" in range_spec:
+            lower = parts[0][2:].strip()
+            upper = parts[1].strip()
+            return version_ge(version, lower) and version_lt(version, upper)
+        if "<" in range_spec:
             parts = range_spec.split("<")
             if len(parts) == 2 and parts[1].strip():
-                upper = _safe_parse_version(parts[1].strip())
-                if upper is not None:
-                    return parsed_actual < upper
-        elif range_spec.startswith("<="):
-            upper = _safe_parse_version(range_spec[2:].strip())
-            if upper is not None:
-                return parsed_actual <= upper
-        elif range_spec.startswith(">="):
-            lower = _safe_parse_version(range_spec[2:].strip())
-            if lower is not None:
-                return parsed_actual >= lower
-
-        target = _safe_parse_version(range_spec)
-        if target is not None:
-            return parsed_actual == target
-        return version == range_spec
+                return version_lt(version, parts[1].strip())
+        if range_spec.startswith("<="):
+            return version_le(version, range_spec[2:].strip())
+        if range_spec.startswith(">="):
+            return version_ge(version, range_spec[2:].strip())
+        return version_eq(version, range_spec)
 
     def extract_from_cve_description(self, cve_id: str, description: str) -> Dict[str, str]:
-        extracted = {}
+        extracted: Dict[str, str] = {}
+        STOP_WORDS = {"the", "a", "an", "of", "in", "on", "at", "to", "for", "is", "was", "and", "or", "not"}
+
         patterns = [
-            r'(?:fixed|patched|resolved)\s+(?:in|with|by)\s+(?:version\s+)?([a-zA-Z0-9._+\-~]+?)(?:\s+of\s+)?([a-zA-Z0-9._+\-~]+)',
-            r'([a-zA-Z0-9._\-]+?)\s+(?:was\s+)?(?:fixed|patched)\s+in\s+(?:version\s+)?([0-9][a-zA-Z0-9._+\-~]*)',
-            r'update\s+(?:to\s+)?(?:version\s+)?([0-9][a-zA-Z0-9._+\-~]*)\s+(?:fixes|addresses|resolves)',
-            r'DSA-\d+[\-\d]*\s+([a-zA-Z0-9._\-]+)\s+(\d[\d.:\-~+a-zA-Z]*)',
-            r'DLA-\d+[\-\d]*\s+([a-zA-Z0-9._\-]+)\s+(\d[\d.:\-~+a-zA-Z]*)',
-            r'(?:RHEA|RHSA|RHBA)-\d{4}:\d+\s+([a-zA-Z0-9._\-]+)\s+(\d[\d.:\-~+a-zA-Z]*)',
+            (r'fixed\s+in\s+version\s+(\d[\w.+\-~]*?)\s+of\s+([a-z][\w.\-]+)', 2, 1),
+            (r'([a-z][\w.\-]+?)\s+was\s+fixed\s+in\s+version\s+(\d[\w.+\-~]*)', 1, 2),
+            (r'update\s+to\s+version\s+(\d[\w.+\-~]*)\s+(?:fixes|addresses|resolves)', 1, 1),
+            (r'DSA-\d+[\-\d]*\s+([a-z][\w.\-]+)\s+(\d[\d.:\-~+a-z]*)', 1, 2),
+            (r'DLA-\d+[\-\d]*\s+([a-z][\w.\-]+)\s+(\d[\d.:\-~+a-z]*)', 1, 2),
+            (r'(RH[SEBA]{2,3}-\d{4}:\d+)', 0, 1),
         ]
 
-        for pattern in patterns:
-            matches = re.findall(pattern, description, re.IGNORECASE)
-            for match in matches:
-                if len(match) == 2:
-                    pkg_name, fix_ver = match
-                    pkg_name = pkg_name.strip().lower()
-                    fix_ver = fix_ver.strip()
-                    if fix_ver and pkg_name:
-                        extracted[pkg_name] = fix_ver
-                elif len(match) == 1:
-                    fix_ver = match[0].strip() if isinstance(match[0], str) else match
-                    if fix_ver and len(fix_ver) > 1:
+        desc_lower = description.lower()
+
+        for pattern, pkg_group, ver_group in patterns:
+            for match in re.findall(pattern, desc_lower, re.IGNORECASE):
+                pkg_name = ""
+                fix_ver = ""
+
+                if pkg_group == 0:
+                    fix_ver = match if isinstance(match, str) else match[0]
+                elif pkg_group == ver_group:
+                    fix_ver = match if isinstance(match, str) else match[0]
+                    pkg_name = "*"
+                else:
+                    if isinstance(match, tuple) and len(match) == 2:
+                        pkg_name = match[pkg_group - 1]
+                        fix_ver = match[ver_group - 1]
+                    elif isinstance(match, str):
+                        fix_ver = match
+
+                fix_ver = fix_ver.strip()
+                if pkg_name:
+                    pkg_name = pkg_name.strip().rstrip(".,;:!?)]}")
+                    if not re.match(r'^[a-z]', pkg_name):
+                        continue
+                    if pkg_name in STOP_WORDS:
+                        continue
+
+                if not fix_ver or not re.search(r'\d', fix_ver):
+                    continue
+
+                if re.match(r'^RH[SEBA]{2,3}-\d{4}:\d+$', fix_ver, re.IGNORECASE):
+                    fix_ver = fix_ver.upper()
+
+                if pkg_name and re.search(r'\d', pkg_name) and len(pkg_name) < 20:
+                    continue
+
+                if pkg_name and pkg_name != "*":
+                    extracted[pkg_name] = fix_ver
+                elif fix_ver:
+                    existing = extracted.get("*", "")
+                    if len(fix_ver) > len(existing) or not existing:
                         extracted["*"] = fix_ver
 
         return extracted
@@ -352,12 +310,10 @@ class VulnerabilityDatabase:
         current_year = datetime.now().year
         if years is None:
             years = list(range(self.config.nvd_start_year, current_year + 1))
-
         updated = False
 
         modified_path = self.db_dir / "nvdcve-2.0-modified.json"
         modified_meta_path = self.db_dir / "nvdcve-2.0-modified.meta"
-
         if self._should_update_modified(modified_meta_path, force):
             try:
                 if not self.config.offline_mode:
@@ -370,13 +326,10 @@ class VulnerabilityDatabase:
             filename = f"nvdcve-2.0-{year}.json"
             file_path = self.db_dir / filename
             meta_path = self.db_dir / f"{filename}.meta"
-
             if not self._should_update(meta_path, year, force):
                 continue
-
             if self.config.offline_mode:
                 continue
-
             url = self.config.nvd_feed_url.format(year=year)
             try:
                 self._download_feed(url, file_path)
@@ -387,7 +340,6 @@ class VulnerabilityDatabase:
 
         if updated:
             self._rebuild_index()
-
         return updated
 
     def _should_update(self, meta_path: Path, year: int, force: bool) -> bool:
@@ -419,7 +371,6 @@ class VulnerabilityDatabase:
     def _download_feed(self, url: str, output_path: Path) -> None:
         response = requests.get(url, stream=True, timeout=120)
         response.raise_for_status()
-
         if url.endswith(".gz"):
             decompressed = gzip.decompress(response.content)
             with open(output_path, "wb") as f:
@@ -429,9 +380,7 @@ class VulnerabilityDatabase:
                 f.write(response.text)
 
     def _update_metadata(self, meta_path: Path) -> None:
-        meta = {
-            "last_updated": datetime.now().isoformat(),
-        }
+        meta = {"last_updated": datetime.now().isoformat()}
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f)
 
@@ -439,10 +388,8 @@ class VulnerabilityDatabase:
         self._entries.clear()
         self._product_index.clear()
         self._vendor_product_index.clear()
-
         all_files = list(self.db_dir.glob("nvdcve-2.0-*.json"))
         all_files = [f for f in all_files if not f.name.endswith(".meta")]
-
         for file_path in all_files:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
@@ -450,7 +397,6 @@ class VulnerabilityDatabase:
                 self._parse_nvd_feed(data)
             except (json.JSONDecodeError, KeyError, IOError):
                 continue
-
         self._save_index()
         self._save_metadata()
 
@@ -460,7 +406,6 @@ class VulnerabilityDatabase:
             cve_data = vuln_item.get("cve", {})
             if not cve_data:
                 continue
-
             cve_id = cve_data.get("id", "")
             if not cve_id:
                 continue
@@ -474,7 +419,6 @@ class VulnerabilityDatabase:
 
             published = cve_data.get("published", "")
             modified = cve_data.get("lastModified", "")
-
             cvss_v3, cvss_v2, severity = self._extract_cvss(cve_data)
 
             cpe_matches: List[str] = []
@@ -491,27 +435,22 @@ class VulnerabilityDatabase:
                         criteria = cpe_match.get("criteria", "")
                         if not criteria:
                             continue
-
                         vulnerable = cpe_match.get("vulnerable", True)
                         cpe_matches.append(criteria)
-
                         parts = criteria.split(":")
                         vendor_part = parts[3] if len(parts) > 3 else ""
                         product_part = parts[4] if len(parts) > 4 else ""
                         version_part = parts[5] if len(parts) > 5 else "*"
-
                         if vendor_part and vendor_part != "*":
                             affected_vendors.add(vendor_part)
                         if product_part and product_part != "*":
                             affected_products.add(product_part)
-
                         version_range = VersionRange(
                             start_including=cpe_match.get("versionStartIncluding"),
                             start_excluding=cpe_match.get("versionStartExcluding"),
                             end_including=cpe_match.get("versionEndIncluding"),
                             end_excluding=cpe_match.get("versionEndExcluding"),
                         )
-
                         detail = CPEMatchDetail(
                             criteria=criteria,
                             vulnerable=vulnerable,
@@ -540,17 +479,26 @@ class VulnerabilityDatabase:
                         ver_match = re.search(r'version[=\-](\d[\d.:\-~+a-zA-Z]*)', decoded, re.IGNORECASE)
                         if ver_match and pkg_name not in fix_versions:
                             fix_versions[pkg_name] = ver_match.group(1)
-
                 if "access.redhat.com/errata" in ref_url:
-                    from urllib.parse import unquote
-                    decoded = unquote(ref_url)
+                    decoded = ref_url
+                    try:
+                        from urllib.parse import unquote
+                        decoded = unquote(ref_url)
+                    except Exception:
+                        pass
                     rhsa_match = re.search(r'(RH[SEBA]{2,3}-\d{4}:\d+)', decoded)
                     if rhsa_match:
                         advisory = rhsa_match.group(1)
                         if "*" not in fix_versions:
                             fix_versions["*"] = advisory
 
+            cleaned_fix: Dict[str, str] = {}
             for pkg, ver in fix_versions.items():
+                if not ver or not re.search(r'\d', ver):
+                    continue
+                if pkg != "*" and re.match(r'^[\d.]+$', pkg) and len(pkg) < 20:
+                    continue
+                cleaned_fix[pkg] = ver
                 if pkg != "*":
                     existing = self.fix_db._fix_data.get(pkg, {})
                     if ver not in existing.values():
@@ -570,9 +518,8 @@ class VulnerabilityDatabase:
                 affected_vendors=affected_vendors,
                 affected_products=affected_products,
                 references=references,
-                fixed_versions={pkg: ver for pkg, ver in fix_versions.items() if ver},
+                fixed_versions=cleaned_fix,
             )
-
             self._entries[cve_id] = entry
             self._index_entry(entry)
 
@@ -580,12 +527,10 @@ class VulnerabilityDatabase:
 
     def _extract_cvss(self, cve_data: dict) -> Tuple[float, float, str]:
         from .utils import cvss_score_to_severity
-
         metrics = cve_data.get("metrics", {})
         cvss_v3 = 0.0
         cvss_v2 = 0.0
         severity = "UNKNOWN"
-
         cvss_v31 = metrics.get("cvssMetricV31", [])
         if cvss_v31:
             cvss_data = cvss_v31[0].get("cvssData", {})
@@ -597,14 +542,12 @@ class VulnerabilityDatabase:
                 cvss_data = cvss_v30[0].get("cvssData", {})
                 cvss_v3 = cvss_data.get("baseScore", 0.0)
                 severity = cvss_data.get("baseSeverity", cvss_score_to_severity(cvss_v3))
-
         cvss_v2_list = metrics.get("cvssMetricV2", [])
         if cvss_v2_list:
             v2_data = cvss_v2_list[0].get("cvssData", {})
             cvss_v2 = v2_data.get("baseScore", 0.0)
             if severity == "UNKNOWN" and cvss_v2 > 0:
                 severity = cvss_score_to_severity(cvss_v2)
-
         return cvss_v3, cvss_v2, severity
 
     def _index_entry(self, entry: VulnerabilityEntry) -> None:
@@ -613,7 +556,6 @@ class VulnerabilityDatabase:
             if product_lower not in self._product_index:
                 self._product_index[product_lower] = set()
             self._product_index[product_lower].add(entry.cve_id)
-
             for vendor in entry.affected_vendors:
                 key = (vendor.lower(), product_lower)
                 if key not in self._vendor_product_index:
@@ -641,7 +583,6 @@ class VulnerabilityDatabase:
 
     def query_by_product(self, product: str, vendor: Optional[str] = None) -> List[VulnerabilityEntry]:
         results: List[VulnerabilityEntry] = []
-
         if vendor:
             key = (vendor.lower(), product.lower())
             cve_ids = self._vendor_product_index.get(key, set())
@@ -655,47 +596,6 @@ class VulnerabilityDatabase:
                 entry = self._entries.get(cve_id)
                 if entry:
                     results.append(entry)
-
-        return results
-
-    def query_by_package(self, package_name: str, package_version: str, distro: str = "") -> List[VulnerabilityEntry]:
-        from .utils import cpe_match_package
-
-        results: List[VulnerabilityEntry] = []
-        seen: Set[str] = set()
-
-        vendor_map = {
-            "debian": ["debian", "canonical"],
-            "rhel": ["redhat", "fedoraproject", "centos"],
-            "alpine": ["alpinelinux"],
-        }
-
-        candidates = vendor_map.get(distro, [""])
-        if distro:
-            candidates = [distro] + candidates
-
-        for candidate_vendor in candidates:
-            key = (candidate_vendor, package_name.lower())
-            if key in self._vendor_product_index:
-                for cve_id in self._vendor_product_index[key]:
-                    if cve_id not in seen:
-                        seen.add(cve_id)
-                        entry = self._entries.get(cve_id)
-                        if entry:
-                            results.append(entry)
-
-        if not results:
-            cve_ids = self._product_index.get(package_name.lower(), set())
-            for cve_id in cve_ids:
-                if cve_id not in seen:
-                    seen.add(cve_id)
-                    entry = self._entries.get(cve_id)
-                    if entry:
-                        for detail in entry.cpe_match_details:
-                            if cpe_match_package(detail.criteria, "", package_name, package_version):
-                                results.append(entry)
-                                break
-
         return results
 
     def get_statistics(self) -> dict:

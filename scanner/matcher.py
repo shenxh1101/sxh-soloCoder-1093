@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from .image_parser import InstalledPackage
-from .utils import cvss_score_to_severity
+from .utils import version_lt, version_le, version_gt, version_ge, version_eq
 from .vuln_db import VulnerabilityDatabase, VulnerabilityEntry, FixVersionDatabase
 
 
@@ -54,20 +54,13 @@ class VulnerabilityMatcher:
         self.ignored_cves = set(cve_ids)
 
     def _version_in_affected_range(self, version: str, version_range, cpe_version: str) -> bool:
-        from packaging import version as pkg_version
-
         if version_range and not version_range.is_unrestricted():
             return version_range.contains_version(version)
 
         if cpe_version == "*" or cpe_version == "-":
             return True
 
-        try:
-            installed = pkg_version.parse(version)
-            cpe_ver = pkg_version.parse(cpe_version)
-            return installed == cpe_ver
-        except pkg_version.InvalidVersion:
-            return version == cpe_version
+        return version_eq(version, cpe_version)
 
     def match_package(self, package: InstalledPackage, distro: str = "") -> List[MatchResult]:
         results: List[MatchResult] = []
@@ -79,7 +72,6 @@ class VulnerabilityMatcher:
         }
 
         vendor_candidates = vendor_map.get(distro, [distro] if distro else [""])
-
         search_terms = [package.name]
         if package.source_name and package.source_name != package.name:
             search_terms.append(package.source_name)
@@ -108,14 +100,12 @@ class VulnerabilityMatcher:
                             or sv in dv
                             or dv in sv
                         )
-
                         product_ok = (
                             dp == "*"
                             or dp == sp
                             or sp in dp
                             or dp in sp
                         )
-
                         if not vendor_ok or not product_ok:
                             continue
 
@@ -178,10 +168,14 @@ class VulnerabilityMatcher:
     def _resolve_fix_version(self, entry: VulnerabilityEntry, package_name: str,
                               installed_version: str, distro: str) -> str:
         if package_name in entry.fixed_versions:
-            return entry.fixed_versions[package_name]
+            ver = entry.fixed_versions[package_name]
+            if ver and ver != package_name and not ver.replace(".", "").isdigit() == False:
+                return ver
 
         if "*" in entry.fixed_versions:
-            return entry.fixed_versions["*"]
+            ver = entry.fixed_versions["*"]
+            if ver and ver != package_name:
+                return ver
 
         fix_ver = self.fix_db.get_fix_version(package_name, installed_version, distro)
         if fix_ver:
@@ -191,11 +185,9 @@ class VulnerabilityMatcher:
 
     def match_packages(self, packages: List[InstalledPackage], distro: str = "") -> List[MatchResult]:
         all_results: List[MatchResult] = []
-
         for package in packages:
             results = self.match_package(package, distro)
             all_results.extend(results)
-
         return self._deduplicate_results(all_results)
 
     def _deduplicate_results(self, results: List[MatchResult]) -> List[MatchResult]:
@@ -215,10 +207,8 @@ class VulnerabilityMatcher:
         medium = sum(1 for r in results if r.severity == "MEDIUM")
         low = sum(1 for r in results if r.severity == "LOW")
         unknown = sum(1 for r in results if r.severity == "UNKNOWN")
-
         unique_packages = len(set(r.package_name for r in results))
         unique_cves = len(set(r.cve_id for r in results))
-
         with_fix = sum(1 for r in results if r.fixed_version)
 
         layer_distribution: Dict[int, int] = {}

@@ -1,60 +1,87 @@
 import hashlib
 import re
-import tarfile
-import tempfile
-from pathlib import Path
-from typing import Optional, Tuple
+
+from typing import List, Tuple, Union
+
+
+def _segment_version(v: str) -> List[Union[int, str]]:
+    segments: List[Union[int, str]] = []
+    for seg in re.split(r'[.\-_:~+]', v):
+        if not seg:
+            continue
+        for part in re.findall(r'(\d+|\D+)', seg):
+            if part.isdigit():
+                segments.append(int(part))
+            else:
+                segments.append(part)
+    return segments
+
+
+def version_compare(a: str, b: str) -> int:
+    if a == b:
+        return 0
+
+    a_epoch, a_rest = _split_epoch(a)
+    b_epoch, b_rest = _split_epoch(b)
+
+    try:
+        ae = int(a_epoch)
+        be = int(b_epoch)
+    except (ValueError, TypeError):
+        ae = 0
+        be = 0
+
+    if ae != be:
+        return -1 if ae < be else 1
+
+    ca = _segment_version(a_rest)
+    cb = _segment_version(b_rest)
+
+    for i in range(min(len(ca), len(cb))):
+        va, vb = ca[i], cb[i]
+        if type(va) is not type(vb):
+            return -1 if isinstance(va, int) else 1
+        if va < vb:
+            return -1
+        if va > vb:
+            return 1
+
+    if len(ca) < len(cb):
+        return -1
+    if len(ca) > len(cb):
+        return 1
+    return 0
+
+
+def _split_epoch(v: str) -> Tuple[str, str]:
+    if ":" in v and re.match(r'^\d+:', v):
+        parts = v.split(":", 1)
+        return parts[0], parts[1]
+    return "0", v
+
+
+def version_lt(a: str, b: str) -> bool:
+    return version_compare(a, b) < 0
+
+
+def version_le(a: str, b: str) -> bool:
+    return version_compare(a, b) <= 0
+
+
+def version_gt(a: str, b: str) -> bool:
+    return version_compare(a, b) > 0
+
+
+def version_ge(a: str, b: str) -> bool:
+    return version_compare(a, b) >= 0
+
+
+def version_eq(a: str, b: str) -> bool:
+    return version_compare(a, b) == 0
 
 
 def sha256_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def find_file_in_tar(tar: tarfile.TarFile, filename: str) -> Optional[bytes]:
-    try:
-        member = tar.getmember(filename)
-        f = tar.extractfile(member)
-        if f:
-            return f.read()
-    except KeyError:
-        pass
-    return None
-
-
-def find_files_in_tar(tar: tarfile.TarFile, pattern: str) -> list:
-    results = []
-    regex = re.compile(pattern)
-    for member in tar.getmembers():
-        if member.isfile() and regex.search(member.name):
-            f = tar.extractfile(member)
-            if f:
-                results.append((member.name, f.read()))
-    return results
-
-
-def normalize_distribution(name: str) -> str:
-    name = name.lower()
-    if name in ("debian", "ubuntu"):
-        return "debian"
-    if name in ("centos", "rhel", "fedora", "rocky", "almalinux", "oraclelinux"):
-        return "rhel"
-    if name in ("alpine",):
-        return "alpine"
-    return name
-
-
-def split_package_version(version_str: str) -> Tuple[str, str]:
-    epoch = "0"
-    if ":" in version_str:
-        epoch, version_str = version_str.split(":", 1)
-
-    release = ""
-    if "-" in version_str:
-        parts = version_str.rsplit("-", 1)
-        if len(parts) == 2 and re.match(r"^[\d]+", parts[1]):
-            version_str, release = parts
-
-    return f"{epoch}:{version_str}-{release}" if release else f"{epoch}:{version_str}"
 
 
 def cvss_score_to_severity(score: float) -> str:
@@ -67,57 +94,6 @@ def cvss_score_to_severity(score: float) -> str:
     elif score > 0:
         return "LOW"
     return "UNKNOWN"
-
-
-def cpe_match_package(cpe_uri: str, vendor: str, product: str, version: str) -> bool:
-    parts = cpe_uri.split(":")
-    if len(parts) < 6:
-        return False
-
-    cpe_vendor = parts[3].lower()
-    cpe_product = parts[4].lower()
-    cpe_version = parts[5] if len(parts) > 5 else "*"
-
-    vendor_match = cpe_vendor == "*" or cpe_vendor == vendor.lower() or vendor.lower() in cpe_vendor or cpe_vendor in vendor.lower()
-    product_match = cpe_product == "*" or cpe_product == product.lower() or product.lower() in cpe_product or cpe_product in product.lower()
-
-    if not vendor_match or not product_match:
-        return False
-
-    if cpe_version == "*" or cpe_version == "-":
-        return True
-
-    return version_match(version, cpe_version)
-
-
-def version_match(actual_version: str, affected_version: str) -> bool:
-    from packaging import version as pkg_version
-
-    try:
-        actual = pkg_version.parse(actual_version)
-    except pkg_version.InvalidVersion:
-        return actual_version == affected_version
-
-    affected_version = affected_version.strip()
-
-    if affected_version.startswith("<="):
-        target = pkg_version.parse(affected_version[2:].strip())
-        return actual <= target
-    elif affected_version.startswith(">="):
-        target = pkg_version.parse(affected_version[2:].strip())
-        return actual >= target
-    elif affected_version.startswith("<"):
-        target = pkg_version.parse(affected_version[1:].strip())
-        return actual < target
-    elif affected_version.startswith(">"):
-        target = pkg_version.parse(affected_version[1:].strip())
-        return actual > target
-
-    try:
-        target = pkg_version.parse(affected_version)
-        return actual == target
-    except pkg_version.InvalidVersion:
-        return actual_version == affected_version
 
 
 def sanitize_filename(name: str) -> str:
